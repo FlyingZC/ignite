@@ -31,7 +31,6 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
 
 import static org.apache.ignite.transactions.TransactionConcurrency.OPTIMISTIC;
-import static org.apache.ignite.transactions.TransactionIsolation.READ_COMMITTED;
 import static org.apache.ignite.transactions.TransactionIsolation.REPEATABLE_READ;
 
 public class TransactionACIDExample {
@@ -70,7 +69,9 @@ public class TransactionACIDExample {
                 System.out.println(">>> " + cache.get(2));
 
                 // Run two parallel transactions
-                executeParallelTransactions(cache);
+                executeParallelTransactionsIsolation(cache);
+                
+                executeParallelTransactionsLockDemo(cache);
 
                 System.out.println();
                 System.out.println(">>> Accounts after transactions: ");
@@ -92,7 +93,7 @@ public class TransactionACIDExample {
      *
      * @param cache Cache instance.
      */
-    private static void executeParallelTransactions(IgniteCache<Integer, Account> cache) throws InterruptedException {
+    private static void executeParallelTransactionsIsolation(IgniteCache<Integer, Account> cache) throws InterruptedException {
         // 主线程等待两个事务都执行完成再结束
         CountDownLatch latch = new CountDownLatch(2);
 
@@ -214,7 +215,119 @@ public class TransactionACIDExample {
         latch.await();
     }
 
+    /**
+     * Execute two parallel transactions demonstrating lock waiting when updating the same row.
+     *
+     * @param cache Cache instance.
+     */
+    private static void executeParallelTransactionsLockDemo(IgniteCache<Integer, Account> cache) throws InterruptedException {
+        CountDownLatch latch = new CountDownLatch(2);
 
+        // 用于控制事务执行顺序的屏障
+        CyclicBarrier startBarrier = new CyclicBarrier(2, () ->
+                System.out.println("Both transactions started"));
+
+        CyclicBarrier tx1UpdatedBarrier = new CyclicBarrier(2, () ->
+                System.out.println("Transaction 1 updated account but not committed yet"));
+
+        CyclicBarrier tx1CommittedBarrier = new CyclicBarrier(2, () ->
+                System.out.println("Transaction 1 committed"));
+
+        // First transaction - lock account 1
+        Thread tx1Thread = new Thread(() -> {
+            try (Transaction tx = Ignition.ignite().transactions().txStart(OPTIMISTIC, TRANSACTION_ISOLATION)) {
+                System.out.println(">>> Transaction 1 started - will lock account 1");
+
+                // 读取账户1
+                Account acct1 = cache.get(1);
+                System.out.println(">>> Transaction 1 - Account 1 before update: " + acct1);
+
+                // 等待事务2开始
+                startBarrier.await();
+
+                // 更新账户1，此时会锁定该记录
+                acct1.update(-50); // 减少50
+                cache.put(1, acct1);
+
+                System.out.println(">>> Transaction 1 - Account 1 updated to: " + acct1);
+                System.out.println(">>> Transaction 1 - holding lock on account 1");
+
+                // 通知事务2可以尝试更新同一账户
+                tx1UpdatedBarrier.await();
+
+                // 等待一段时间，让事务2尝试获取锁
+                Thread.sleep(2000);
+
+                // 提交事务，释放锁
+                tx.commit();
+                System.out.println(">>> Transaction 1 committed - lock released");
+
+                tx1CommittedBarrier.await();
+            }
+            catch (Exception e) {
+                System.out.println(">>> Transaction 1 failed: " + e.getMessage());
+                e.printStackTrace();
+            }
+            finally {
+                latch.countDown();
+            }
+        });
+
+        // Second transaction - try to update the same account (will wait for lock)
+        Thread tx2Thread = new Thread(() -> {
+            try (Transaction tx = Ignition.ignite().transactions().txStart(OPTIMISTIC, TRANSACTION_ISOLATION)) {
+                System.out.println(">>> Transaction 2 started - will try to update account 1");
+
+                // 等待事务1开始
+                startBarrier.await();
+
+                // 等待事务1锁定账户1
+                tx1UpdatedBarrier.await();
+
+                System.out.println(">>> Transaction 2 - trying to read account 1 (will wait for lock)");
+
+                // 尝试读取被锁定的账户 - 这将等待直到锁被释放
+                long startTime = System.currentTimeMillis();
+                Account acct1 = cache.get(1);
+                long endTime = System.currentTimeMillis();
+
+                System.out.println(">>> Transaction 2 - Account 1 read after " + (endTime - startTime) + "ms: " + acct1);
+                System.out.println(">>> Transaction 2 - updating account 1");
+
+                // 更新账户1
+                acct1.update(-100); // 再减少100
+                cache.put(1, acct1);
+
+                System.out.println(">>> Transaction 2 - Account 1 updated to: " + acct1);
+
+                // 等待事务1提交完成
+                tx1CommittedBarrier.await();
+
+                // 提交事务2
+                tx.commit();
+                System.out.println(">>> Transaction 2 committed");
+            }
+            catch (Exception e) {
+                System.out.println(">>> Transaction 2 failed: " + e.getMessage());
+                e.printStackTrace();
+            }
+            finally {
+                latch.countDown();
+            }
+        });
+
+        // Start both transactions
+        tx1Thread.start();
+        tx2Thread.start();
+
+        // Wait for both transactions to complete
+        latch.await();
+
+        // 显示最终结果
+        Account finalAcct1 = cache.get(1);
+        System.out.println(">>> Final Account 1 balance: " + finalAcct1);
+    }
+    
     /**
      * Account.
      */
